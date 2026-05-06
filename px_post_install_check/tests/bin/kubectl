@@ -1,0 +1,136 @@
+#!/bin/bash
+# Mock kubectl/oc for setup_clusters tests. Behavior is driven by env vars
+# set by tests/test_setup_clusters.sh:
+#   MOCK_PXB_UI_NS    namespace where 'px-backup-ui' lives (empty = absent)
+#   MOCK_STORK_NS     namespace where 'stork-service' lives (empty = absent)
+#   MOCK_PXE_NS       namespace where 'portworx-api' lives (empty = absent)
+#   MOCK_PXB_KC       kubeconfig path identifying the PXB cluster
+#   MOCK_APP_KC       kubeconfig path identifying the app cluster
+# Anything not modeled here returns success with empty output so that
+# unrelated kubectl invocations during setup_clusters do not derail tests.
+
+# Strip leading --kubeconfig=... and capture which cluster we are talking to.
+kc=""
+args=()
+for a in "$@"; do
+    case "$a" in
+        --kubeconfig=*) kc="${a#--kubeconfig=}" ;;
+        --request-timeout=*) ;;
+        *)              args+=("$a") ;;
+    esac
+done
+
+# Determine which cluster's services to expose based on kubeconfig path.
+case "$kc" in
+    "$MOCK_PXB_KC")
+        pxb_ui_ns="$MOCK_PXB_UI_NS"
+        stork_ns=""
+        pxe_ns=""
+        ;;
+    "$MOCK_APP_KC")
+        pxb_ui_ns=""
+        stork_ns="$MOCK_STORK_NS"
+        pxe_ns="$MOCK_PXE_NS"
+        ;;
+    *)
+        pxb_ui_ns=""; stork_ns=""; pxe_ns=""
+        ;;
+esac
+
+# Reassemble for pattern matching.
+joined="${args[*]}"
+
+# version: short-circuit so derive_cli_tool succeeds.
+if [[ "${args[0]}" == "version" ]]; then
+    echo "Client Version: mock"
+    exit 0
+fi
+
+# Platform detection regression mode: model a non-OCP managed Kubernetes
+# cluster where clusterversion is absent but normal node/version probes work.
+if [[ "${MOCK_PLATFORM_NON_OCP:-}" == "true" ]]; then
+    if [[ "${args[0]}" == "get" && "${args[1]}" == "clusterversion" ]]; then
+        exit 1
+    fi
+    if [[ "${args[0]}" == "get" && "${args[1]}" == "ns" && "${args[2]}" == "cattle-system" ]]; then
+        exit 1
+    fi
+    if [[ "${args[0]}" == "get" && "${args[1]}" == "crd" && "${args[2]}" == "tanzukubernetesreleases.run.tanzu.vmware.com" ]]; then
+        exit 1
+    fi
+    if [[ "${args[0]}" == "get" && "${args[1]}" == "nodes" ]]; then
+        printf '%s\n' 'map[cloud.google.com/gke-nodepool:pool-a kubernetes.io/os:linux]|gce://project/us-central1-a/node-1|Container-Optimized OS from Google|containerd://1.7.0'
+        exit 0
+    fi
+    if [[ "${args[0]}" == "get" && "${args[1]}" == "--raw" && "${args[2]}" == "/version" ]]; then
+        printf '%s\n' '{"gitVersion":"v1.27.3"}'
+        exit 0
+    fi
+fi
+
+# Pod health check tests:
+#   MOCK_PHC_OCP          "true" -> emit an OCP api-resources row so
+#                         is_openshift_cluster sees a non-empty result
+#   MOCK_PHC_PODS         multi-line structured output for `get pods`
+#   MOCK_PHC_RUN_AS_USER  value returned for the px-backup Deployment's
+#                         spec.template.spec.securityContext.runAsUser
+#   MOCK_PHC_FS_GROUP     same, for fsGroup
+if [[ "${args[0]}" == "api-resources" && "$joined" == *"apps.openshift.io"* ]]; then
+    if [[ "${MOCK_PHC_OCP:-}" == "true" ]]; then
+        echo "deploymentconfigs   dc   apps.openshift.io/v1   true   DeploymentConfig"
+    fi
+    exit 0
+fi
+
+# -n <ns> get pods -o jsonpath=... : drive the pod_health_check scan.
+if [[ "${args[0]}" == "-n" && "${args[2]}" == "get" && "${args[3]}" == "pods" ]]; then
+    [[ -n "${MOCK_PHC_PODS:-}" ]] && printf '%s' "$MOCK_PHC_PODS"
+    exit 0
+fi
+
+# -n <ns> get deployment px-backup -o jsonpath='{...runAsUser/fsGroup...}'
+if [[ "${args[0]}" == "-n" && "${args[2]}" == "get" && "${args[3]}" == "deployment" && "${args[4]}" == "px-backup" ]]; then
+    case "$joined" in
+        *runAsUser*) printf '%s' "${MOCK_PHC_RUN_AS_USER:-}" ;;
+        *fsGroup*)   printf '%s' "${MOCK_PHC_FS_GROUP:-}" ;;
+    esac
+    exit 0
+fi
+
+# get svc -A -o jsonpath=...: emit the namespace for the requested service.
+if [[ "${args[0]}" == "get" && "${args[1]}" == "svc" && "${args[2]}" == "-A" ]]; then
+    svc=""
+    case "$joined" in
+        *px-backup-ui*) svc="px-backup-ui" ;;
+        *stork-service*) svc="stork-service" ;;
+        *portworx-api*)  svc="portworx-api" ;;
+    esac
+    case "$svc" in
+        px-backup-ui)  [[ -n "$pxb_ui_ns" ]] && printf '%s\n' "$pxb_ui_ns" ;;
+        stork-service) [[ -n "$stork_ns"   ]] && printf '%s\n' "$stork_ns" ;;
+        portworx-api)  [[ -n "$pxe_ns"     ]] && printf '%s\n' "$pxe_ns" ;;
+    esac
+    exit 0
+fi
+
+# -n <ns> get svc <name>: existence check used by resolve_namespace_with_svc_fallback.
+if [[ "${args[0]}" == "-n" && "${args[2]}" == "get" && "${args[3]}" == "svc" ]]; then
+    ns="${args[1]}"
+    svc="${args[4]}"
+    case "$svc" in
+        px-backup-ui)  [[ "$ns" == "$pxb_ui_ns" ]] && exit 0 || exit 1 ;;
+        stork-service) [[ "$ns" == "$stork_ns"   ]] && exit 0 || exit 1 ;;
+        portworx-api)  [[ "$ns" == "$pxe_ns"     ]] && exit 0 || exit 1 ;;
+    esac
+    exit 1
+fi
+
+# get ns <name>: pretend every namespace exists. resolve_namespace only uses
+# this to validate presets / defaults; tests cover the missing-namespace path
+# indirectly through the svc-anchored fallback, not through this gate.
+if [[ "${args[0]}" == "get" && "${args[1]}" == "ns" ]]; then
+    exit 0
+fi
+
+# Default: succeed quietly so unrelated probes do not fail the harness.
+exit 0
